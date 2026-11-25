@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core.config import DEFAULT_DEV_API_KEY, ConfigError, Settings
+from app.core.config import DEFAULT_DEV_SECRET_KEY, ConfigError, Settings
+from app.core.logging import JsonFormatter
 from app.core.middleware import RateLimiter
 from app.main import create_app
 from tests.conftest import make_settings
@@ -18,12 +20,15 @@ def test_health_has_timing_header(client):
     assert "X-Process-Time-Ms" in res.headers
 
 
-@pytest.mark.parametrize("headers", [{}, {"X-API-Key": "chave-errada"}, {"X-API-Key": ""}])
-def test_protected_routes_require_api_key(client, headers):
-    for path in ("/api/v1/tasks", "/api/v1/projects", "/api/v1/stats"):
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Authorization": "Bearer token-invalido"}, {"Authorization": "Basic abc"}],
+)
+def test_protected_routes_require_bearer_jwt(client, headers):
+    for path in ("/api/v1/tasks", "/api/v1/projects", "/api/v1/stats", "/api/v1/auth/me"):
         res = client.get(path, headers=headers)
         assert res.status_code == 401, path
-        assert res.headers["WWW-Authenticate"] == "ApiKey"
+        assert res.headers["WWW-Authenticate"] == "Bearer"
 
 
 def test_rate_limit_returns_429():
@@ -63,35 +68,41 @@ def test_unexpected_error_returns_500_without_leaking_details(client, auth, capl
     assert "RuntimeError" in caplog.text
 
 
-def test_api_key_is_not_logged(client, auth, caplog):
+def test_bearer_token_is_not_logged(client, auth, caplog):
     with caplog.at_level(logging.DEBUG):
         client.get("/api/v1/tasks", headers=auth)
-        client.get("/api/v1/tasks", headers={"X-API-Key": "chave-errada-xyz"})
-    assert auth["X-API-Key"] not in caplog.text
-    assert "chave-errada-xyz" not in caplog.text
+        client.get("/api/v1/tasks", headers={"Authorization": "Bearer segredo-invalido-xyz"})
+    assert auth["Authorization"] not in caplog.text
+    assert "segredo-invalido-xyz" not in caplog.text
 
 
 def test_settings_from_env(monkeypatch):
-    monkeypatch.setenv("API_SECRET_KEY", "x" * 32)
+    monkeypatch.setenv("SECRET_KEY", "x" * 40)
     monkeypatch.setenv("CORS_ORIGINS", "https://a.com, https://b.com,")
     monkeypatch.setenv("RATE_LIMIT_MAX_REQUESTS", "5")
+    monkeypatch.setenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
+    monkeypatch.setenv("REFRESH_TOKEN_EXPIRE_DAYS", "14")
     settings = Settings.from_env()
     assert settings.cors_origins == ["https://a.com", "https://b.com"]
     assert settings.rate_limit_max_requests == 5
-    assert "x" * 32 not in repr(settings)
+    assert settings.access_token_expire_minutes == 30
+    assert settings.refresh_token_expire_days == 14
+    assert "x" * 40 not in repr(settings)
 
 
 @pytest.mark.parametrize(
     "env",
     [
         {"ENVIRONMENT": "production"},
-        {"API_SECRET_KEY": "curta"},
+        {"SECRET_KEY": "curta-demais"},
         {"RATE_LIMIT_MAX_REQUESTS": "abc"},
         {"RATE_LIMIT_WINDOW_SECONDS": "0"},
+        {"ACCESS_TOKEN_EXPIRE_MINUTES": "0"},
+        {"REFRESH_TOKEN_EXPIRE_DAYS": "-1"},
     ],
 )
 def test_settings_reject_invalid_config(monkeypatch, env):
-    monkeypatch.delenv("API_SECRET_KEY", raising=False)
+    monkeypatch.delenv("SECRET_KEY", raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     with pytest.raises(ConfigError):
@@ -99,9 +110,9 @@ def test_settings_reject_invalid_config(monkeypatch, env):
 
 
 def test_default_dev_key_allowed_outside_production(monkeypatch):
-    monkeypatch.delenv("API_SECRET_KEY", raising=False)
+    monkeypatch.delenv("SECRET_KEY", raising=False)
     monkeypatch.delenv("ENVIRONMENT", raising=False)
-    assert Settings.from_env().api_secret_key == DEFAULT_DEV_API_KEY
+    assert Settings.from_env().secret_key == DEFAULT_DEV_SECRET_KEY
 
 
 def test_cors_wildcard_disables_credentials(client):
@@ -122,7 +133,6 @@ def test_liveness_and_readiness_probes(client, monkeypatch):
     assert ready.status_code == 200
     assert ready.json()["database"] == "conectado"
 
-    # Simula falha do banco no readiness probe -> 503
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.orm import Session
 
@@ -137,7 +147,6 @@ def test_liveness_and_readiness_probes(client, monkeypatch):
 
 
 def test_request_id_and_security_headers(client, auth):
-    # Propaga X-Request-ID válido
     res = client.get("/api/v1/tasks", headers={**auth, "X-Request-ID": "req-abc_123"})
     assert res.status_code == 200
     assert res.headers["X-Request-ID"] == "req-abc_123"
@@ -149,7 +158,6 @@ def test_request_id_and_security_headers(client, auth):
     assert "X-RateLimit-Remaining" in res.headers
     assert "X-RateLimit-Reset" in res.headers
 
-    # Rejeita X-Request-ID com caracteres inválidos e gera novo
     bad = client.get("/health/live", headers={"X-Request-ID": "bad\nheader"})
     assert bad.headers["X-Request-ID"] != "bad\nheader"
     assert len(bad.headers["X-Request-ID"]) == 32
@@ -171,10 +179,6 @@ def test_rate_limiter_evicts_stale_keys():
 
 
 def test_json_log_formatter():
-    import json
-
-    from app.core.logging import JsonFormatter
-
     record = logging.LogRecord(
         name="taskflow_api.http",
         level=logging.INFO,

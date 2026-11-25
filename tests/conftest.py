@@ -9,13 +9,13 @@ from fastapi.testclient import TestClient
 from app.core.config import Settings
 from app.main import create_app
 
-API_KEY = "test-secret-key-0123456789"
+TEST_SECRET_KEY = "test-jwt-secret-key-0123456789abcdef"
 
 
 def make_settings(**overrides: Any) -> Settings:
     base: dict[str, Any] = {
         "database_url": "sqlite://",
-        "api_secret_key": API_KEY,
+        "secret_key": TEST_SECRET_KEY,
         "rate_limit_max_requests": 10_000,
         "log_level": "WARNING",
     }
@@ -30,8 +30,34 @@ def client() -> Iterator[TestClient]:
 
 
 @pytest.fixture
-def auth() -> dict[str, str]:
-    return {"X-API-Key": API_KEY}
+def register_and_login(client: TestClient) -> Callable[..., tuple[dict[str, Any], dict[str, str]]]:
+    def _helper(
+        email: str = "alice@example.com",
+        password: str = "StrongPass123",
+        full_name: str = "Alice Silva",
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        reg = client.post(
+            "/api/v1/auth/register",
+            json={"email": email, "password": password, "full_name": full_name},
+        )
+        assert reg.status_code == 201, reg.text
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": password},
+        )
+        assert login.status_code == 200, login.text
+        tokens = login.json()
+        return tokens, {"Authorization": f"Bearer {tokens['access_token']}"}
+
+    return _helper
+
+
+@pytest.fixture
+def auth(
+    register_and_login: Callable[..., tuple[dict[str, Any], dict[str, str]]],
+) -> dict[str, str]:
+    _, headers = register_and_login()
+    return headers
 
 
 @pytest.fixture

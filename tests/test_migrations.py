@@ -20,14 +20,24 @@ def test_alembic_upgrade_and_downgrade(tmp_path: Path, monkeypatch):
 
     engine = create_engine(url)
     tables = set(inspect(engine).get_table_names())
-    assert {"projects", "tasks", "tags", "task_tags", "task_comments", "alembic_version"} <= tables
+    expected = {
+        "users",
+        "refresh_tokens",
+        "projects",
+        "tasks",
+        "tags",
+        "task_tags",
+        "task_comments",
+        "task_exports",
+        "alembic_version",
+    }
+    assert expected <= tables
     engine.dispose()
 
-    # A aplicação sobe normalmente com auto_create_tables=False sobre o banco migrado
     app = create_app(
         Settings(
             database_url=url,
-            api_secret_key="test-secret-key-0123456789",
+            secret_key="test-jwt-secret-key-0123456789abcdef",
             auto_create_tables=False,
             log_level="WARNING",
         )
