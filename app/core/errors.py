@@ -48,7 +48,7 @@ class ServiceUnavailableError(AppError):
 async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)
     logger.info("%s em %s: %s", type(exc).__name__, request.url.path, exc.message)
-    headers = {"WWW-Authenticate": "ApiKey"} if isinstance(exc, UnauthorizedError) else None
+    headers = {"WWW-Authenticate": "Bearer"} if isinstance(exc, UnauthorizedError) else None
     return JSONResponse(
         status_code=exc.status_code,
         content={
