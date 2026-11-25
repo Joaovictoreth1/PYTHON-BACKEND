@@ -1,4 +1,4 @@
-"""Indicadores consolidados."""
+"""Indicadores consolidados por usuário."""
 
 from __future__ import annotations
 
@@ -15,11 +15,11 @@ class StatsService:
         self.projects = ProjectRepository(db)
         self.tasks = TaskRepository(db)
 
-    def dashboard(self) -> StatsResponse:
+    def dashboard(self, user_id: int) -> StatsResponse:
         return StatsResponse(
-            total_projects=self.projects.count(),
-            total_tasks=self.tasks.count(),
-            overdue_tasks=self.tasks.count_overdue(utcnow()),
-            by_status=self.tasks.count_by_status(),
-            by_priority=self.tasks.count_by_priority(),
+            total_projects=self.projects.count(user_id),
+            total_tasks=self.tasks.count(user_id),
+            overdue_tasks=self.tasks.count_overdue(user_id, utcnow()),
+            by_status=self.tasks.count_by_status(user_id),
+            by_priority=self.tasks.count_by_priority(user_id),
         )

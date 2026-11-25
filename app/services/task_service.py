@@ -1,4 +1,4 @@
-"""Regras de negócio de tarefas."""
+"""Regras de negócio de tarefas com isolamento por usuário."""
 
 from __future__ import annotations
 
@@ -22,38 +22,40 @@ class TaskService:
         self.projects = ProjectRepository(db)
         self.tags = TagRepository(db)
 
-    def _get_or_404(self, task_id: int) -> TaskModel:
-        task = self.repo.get(task_id)
+    def _get_or_404(self, user_id: int, task_id: int) -> TaskModel:
+        task = self.repo.get(user_id, task_id)
         if task is None:
             raise NotFoundError(f"Tarefa {task_id} não encontrada.")
         return task
 
-    def _ensure_project_exists(self, project_id: int | None) -> None:
-        if project_id is not None and not self.projects.exists(project_id):
+    def _ensure_project_exists(self, user_id: int, project_id: int | None) -> None:
+        if project_id is not None and not self.projects.exists(user_id, project_id):
             raise NotFoundError(f"Projeto ID {project_id} não encontrado.")
 
-    def _resolve_tags(self, tag_ids: list[int]) -> list[TagModel]:
+    def _resolve_tags(self, user_id: int, tag_ids: list[int]) -> list[TagModel]:
         if not tag_ids:
             return []
-        found = self.tags.get_many(tag_ids)
+        found = self.tags.get_many(user_id, tag_ids)
         found_ids = {t.id for t in found}
         missing = [tid for tid in tag_ids if tid not in found_ids]
         if missing:
             raise NotFoundError(f"Tag(s) não encontrada(s): {missing}.")
         return found
 
-    def create(self, data: TaskCreate) -> TaskResponse:
-        self._ensure_project_exists(data.project_id)
-        tags = self._resolve_tags(data.tag_ids)
+    def create(self, user_id: int, data: TaskCreate) -> TaskResponse:
+        self._ensure_project_exists(user_id, data.project_id)
+        tags = self._resolve_tags(user_id, data.tag_ids)
         payload = data.model_dump(exclude={"tag_ids"})
         if payload.get("status") == TaskStatus.CONCLUIDA:
             payload["completed_at"] = utcnow()
-        task = self.repo.add(tags=tags, **payload)
-        logger.info("Tarefa criada | id=%d", task.id)
+        task = self.repo.add(user_id=user_id, tags=tags, **payload)
+        logger.info("Tarefa criada | id=%d | user_id=%d", task.id, user_id)
         return TaskResponse.model_validate(task)
 
-    def list(self, filters: TaskFilters, skip: int, limit: int) -> PaginatedTaskResponse:
-        total, items = self.repo.list(filters, skip, limit)
+    def list(
+        self, user_id: int, filters: TaskFilters, skip: int, limit: int
+    ) -> PaginatedTaskResponse:
+        total, items = self.repo.list(user_id, filters, skip, limit)
         return PaginatedTaskResponse(
             total=total,
             skip=skip,
@@ -61,11 +63,11 @@ class TaskService:
             items=[TaskResponse.model_validate(t) for t in items],
         )
 
-    def get(self, task_id: int) -> TaskResponse:
-        return TaskResponse.model_validate(self._get_or_404(task_id))
+    def get(self, user_id: int, task_id: int) -> TaskResponse:
+        return TaskResponse.model_validate(self._get_or_404(user_id, task_id))
 
-    def update(self, task_id: int, data: TaskUpdate) -> TaskResponse:
-        task = self._get_or_404(task_id)
+    def update(self, user_id: int, task_id: int, data: TaskUpdate) -> TaskResponse:
+        task = self._get_or_404(user_id, task_id)
         changes = data.model_dump(exclude_unset=True)
 
         expected_version = changes.pop("version", None)
@@ -75,11 +77,11 @@ class TaskService:
             )
 
         if "project_id" in changes:
-            self._ensure_project_exists(changes["project_id"])
+            self._ensure_project_exists(user_id, changes["project_id"])
 
         new_tags: list[TagModel] | None = None
         if "tag_ids" in changes:
-            new_tags = self._resolve_tags(changes.pop("tag_ids"))
+            new_tags = self._resolve_tags(user_id, changes.pop("tag_ids"))
 
         if "status" in changes:
             new_status = changes["status"]
@@ -92,7 +94,7 @@ class TaskService:
         logger.info("Tarefa atualizada | id=%d | versao=%d", task.id, task.version)
         return TaskResponse.model_validate(task)
 
-    def delete(self, task_id: int) -> None:
-        task = self._get_or_404(task_id)
+    def delete(self, user_id: int, task_id: int) -> None:
+        task = self._get_or_404(user_id, task_id)
         self.repo.delete(task)
-        logger.info("Tarefa removida | id=%d", task_id)
+        logger.info("Tarefa removida | id=%d | user_id=%d", task_id, user_id)

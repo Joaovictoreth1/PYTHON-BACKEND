@@ -1,4 +1,4 @@
-"""Acesso a dados de projetos."""
+"""Acesso a dados de projetos com isolamento por usuário."""
 
 from __future__ import annotations
 
@@ -14,39 +14,52 @@ class ProjectRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def get(self, project_id: int) -> ProjectModel | None:
-        return self.db.get(ProjectModel, project_id)
+    def get(self, user_id: int, project_id: int) -> ProjectModel | None:
+        stmt = select(ProjectModel).where(
+            ProjectModel.id == project_id, ProjectModel.user_id == user_id
+        )
+        return self.db.scalar(stmt)
 
-    def get_by_name(self, name: str) -> ProjectModel | None:
-        return self.db.scalar(select(ProjectModel).where(ProjectModel.name == name))
+    def get_by_name(self, user_id: int, name: str) -> ProjectModel | None:
+        stmt = select(ProjectModel).where(
+            ProjectModel.user_id == user_id, ProjectModel.name == name
+        )
+        return self.db.scalar(stmt)
 
-    def exists(self, project_id: int) -> bool:
-        return self.get(project_id) is not None
+    def exists(self, user_id: int, project_id: int) -> bool:
+        return self.get(user_id, project_id) is not None
 
-    def count(self) -> int:
-        return self.db.scalar(select(func.count(ProjectModel.id))) or 0
-
-    def task_count(self, project_id: int) -> int:
-        stmt = select(func.count(TaskModel.id)).where(TaskModel.project_id == project_id)
+    def count(self, user_id: int) -> int:
+        stmt = select(func.count(ProjectModel.id)).where(ProjectModel.user_id == user_id)
         return self.db.scalar(stmt) or 0
 
-    def list_with_task_counts(self, skip: int, limit: int) -> list[tuple[ProjectModel, int]]:
+    def task_count(self, user_id: int, project_id: int) -> int:
+        stmt = select(func.count(TaskModel.id)).where(
+            TaskModel.user_id == user_id, TaskModel.project_id == project_id
+        )
+        return self.db.scalar(stmt) or 0
+
+    def list_with_task_counts(
+        self, user_id: int, skip: int, limit: int
+    ) -> list[tuple[ProjectModel, int]]:
         task_counts = (
             select(TaskModel.project_id, func.count(TaskModel.id).label("task_count"))
+            .where(TaskModel.user_id == user_id)
             .group_by(TaskModel.project_id)
             .subquery()
         )
         stmt = (
             select(ProjectModel, func.coalesce(task_counts.c.task_count, 0))
             .outerjoin(task_counts, task_counts.c.project_id == ProjectModel.id)
+            .where(ProjectModel.user_id == user_id)
             .order_by(ProjectModel.created_at.desc(), ProjectModel.id.desc())
             .offset(skip)
             .limit(limit)
         )
         return [(project, int(count)) for project, count in self.db.execute(stmt).all()]
 
-    def add(self, **data: Any) -> ProjectModel:
-        project = ProjectModel(**data)
+    def add(self, user_id: int, **data: Any) -> ProjectModel:
+        project = ProjectModel(user_id=user_id, **data)
         self.db.add(project)
         self.db.commit()
         self.db.refresh(project)

@@ -1,4 +1,4 @@
-"""Acesso a dados de tarefas."""
+"""Acesso a dados de tarefas com isolamento por usuário."""
 
 from __future__ import annotations
 
@@ -49,7 +49,6 @@ def _order_clauses(sort_by: TaskSortField, sort_order: SortOrder) -> list[Any]:
         return [primary, TaskModel.id.desc()]
     if sort_by == TaskSortField.DUE_DATE:
         col = TaskModel.due_date.asc() if asc else TaskModel.due_date.desc()
-        # Tarefas sem prazo ficam sempre por último.
         return [TaskModel.due_date.is_(None).asc(), col, TaskModel.id.desc()]
 
     column_map = {
@@ -65,10 +64,18 @@ class TaskRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def get(self, task_id: int) -> TaskModel | None:
-        return self.db.get(TaskModel, task_id)
+    def get(self, user_id: int, task_id: int) -> TaskModel | None:
+        stmt = (
+            select(TaskModel)
+            .options(selectinload(TaskModel.tags))
+            .where(TaskModel.id == task_id, TaskModel.user_id == user_id)
+        )
+        return self.db.scalar(stmt)
 
-    def _apply_filters(self, stmt: Select[Any], filters: TaskFilters) -> Select[Any]:
+    def _apply_filters(
+        self, stmt: Select[Any], user_id: int, filters: TaskFilters
+    ) -> Select[Any]:
+        stmt = stmt.where(TaskModel.user_id == user_id)
         if filters.status:
             stmt = stmt.where(TaskModel.status == filters.status)
         if filters.priority:
@@ -84,7 +91,11 @@ class TaskRepository:
                 TaskModel.title.ilike(f"%{_escape_like(filters.search)}%", escape="\\")
             )
         if filters.tag:
-            stmt = stmt.where(TaskModel.tags.any(TagModel.name == filters.tag.strip().lower()))
+            stmt = stmt.where(
+                TaskModel.tags.any(
+                    (TagModel.user_id == user_id) & (TagModel.name == filters.tag.strip().lower())
+                )
+            )
         if filters.due_before is not None:
             stmt = stmt.where(
                 TaskModel.due_date.is_not(None), TaskModel.due_date <= filters.due_before
@@ -111,38 +122,61 @@ class TaskRepository:
             )
         return stmt
 
-    def list(self, filters: TaskFilters, skip: int, limit: int) -> tuple[int, list[TaskModel]]:
-        total_stmt = self._apply_filters(select(func.count(TaskModel.id)), filters)
+    def list(
+        self, user_id: int, filters: TaskFilters, skip: int, limit: int
+    ) -> tuple[int, list[TaskModel]]:
+        total_stmt = self._apply_filters(select(func.count(TaskModel.id)), user_id, filters)
         total = self.db.scalar(total_stmt) or 0
         items_stmt = (
-            self._apply_filters(select(TaskModel).options(selectinload(TaskModel.tags)), filters)
+            self._apply_filters(
+                select(TaskModel).options(selectinload(TaskModel.tags)), user_id, filters
+            )
             .order_by(*_order_clauses(filters.sort_by, filters.sort_order))
             .offset(skip)
             .limit(limit)
         )
         return total, list(self.db.scalars(items_stmt).all())
 
-    def count(self) -> int:
-        return self.db.scalar(select(func.count(TaskModel.id))) or 0
+    def list_all_for_user(self, user_id: int) -> list[TaskModel]:
+        stmt = (
+            select(TaskModel)
+            .options(selectinload(TaskModel.tags))
+            .where(TaskModel.user_id == user_id)
+            .order_by(TaskModel.created_at.desc(), TaskModel.id.desc())
+        )
+        return list(self.db.scalars(stmt).all())
 
-    def count_overdue(self, now: datetime) -> int:
+    def count(self, user_id: int) -> int:
+        stmt = select(func.count(TaskModel.id)).where(TaskModel.user_id == user_id)
+        return self.db.scalar(stmt) or 0
+
+    def count_overdue(self, user_id: int, now: datetime) -> int:
         stmt = select(func.count(TaskModel.id)).where(
+            TaskModel.user_id == user_id,
             TaskModel.due_date.is_not(None),
             TaskModel.due_date < now,
             TaskModel.status.not_in(CLOSED_STATUSES),
         )
         return self.db.scalar(stmt) or 0
 
-    def count_by_status(self) -> dict[str, int]:
-        stmt = select(TaskModel.status, func.count(TaskModel.id)).group_by(TaskModel.status)
+    def count_by_status(self, user_id: int) -> dict[str, int]:
+        stmt = (
+            select(TaskModel.status, func.count(TaskModel.id))
+            .where(TaskModel.user_id == user_id)
+            .group_by(TaskModel.status)
+        )
         return {row[0].value: row[1] for row in self.db.execute(stmt).all()}
 
-    def count_by_priority(self) -> dict[str, int]:
-        stmt = select(TaskModel.priority, func.count(TaskModel.id)).group_by(TaskModel.priority)
+    def count_by_priority(self, user_id: int) -> dict[str, int]:
+        stmt = (
+            select(TaskModel.priority, func.count(TaskModel.id))
+            .where(TaskModel.user_id == user_id)
+            .group_by(TaskModel.priority)
+        )
         return {row[0].value: row[1] for row in self.db.execute(stmt).all()}
 
-    def add(self, tags: Sequence[TagModel], **data: Any) -> TaskModel:
-        task = TaskModel(**data)
+    def add(self, user_id: int, tags: Sequence[TagModel], **data: Any) -> TaskModel:
+        task = TaskModel(user_id=user_id, **data)
         task.tags = list(tags)
         self.db.add(task)
         self.db.commit()
