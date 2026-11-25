@@ -15,15 +15,28 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   api:
     build: .
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       ENVIRONMENT: development
       DATABASE_URL: postgresql+psycopg://taskflow:taskflow_local_password@db:5432/taskflow
-      API_SECRET_KEY: local-docker-secret-key-2026
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: local-docker-jwt-secret-key-at-least-32-chars
       AUTO_CREATE_TABLES: "false"
       LOG_FORMAT: json
     ports:
