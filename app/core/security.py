@@ -26,11 +26,11 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def hash_password(password: str) -> str:
-    return _password_hasher.hash(password)
+    return str(_password_hasher.hash(password))
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return _password_hasher.verify(plain_password, hashed_password)
+    return bool(_password_hasher.verify(plain_password, hashed_password))
 
 
 def generate_refresh_token() -> str:
