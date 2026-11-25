@@ -54,7 +54,11 @@ def test_unexpected_error_returns_500_without_leaking_details(client, auth, capl
     with caplog.at_level(logging.ERROR, logger="taskflow_api"):
         res = client.get("/api/v1/tasks/1", headers=auth)
     assert res.status_code == 500
-    assert res.json() == {"error": "Erro interno no servidor", "path": "/api/v1/tasks/1"}
+    body = res.json()
+    assert body["code"] == "internal_error"
+    assert body["error"] == "Erro interno no servidor"
+    assert body["path"] == "/api/v1/tasks/1"
+    assert len(body["request_id"]) == 32
     assert "segredo-do-usuario" not in caplog.text
     assert "RuntimeError" in caplog.text
 
@@ -107,3 +111,99 @@ def test_cors_wildcard_disables_credentials(client):
     )
     assert res.headers.get("access-control-allow-origin") == "*"
     assert "access-control-allow-credentials" not in res.headers
+
+
+def test_liveness_and_readiness_probes(client, monkeypatch):
+    live = client.get("/health/live")
+    assert live.status_code == 200
+    assert live.json()["status"] == "alive"
+
+    ready = client.get("/health/ready")
+    assert ready.status_code == 200
+    assert ready.json()["database"] == "conectado"
+
+    # Simula falha do banco no readiness probe -> 503
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import Session
+
+    def fail_execute(*_args, **_kwargs):
+        raise OperationalError("SELECT 1", {}, Exception("down"))
+
+    monkeypatch.setattr(Session, "execute", fail_execute)
+    down = client.get("/health/ready")
+    assert down.status_code == 503
+    assert down.json()["code"] == "service_unavailable"
+    assert "request_id" in down.json()
+
+
+def test_request_id_and_security_headers(client, auth):
+    # Propaga X-Request-ID válido
+    res = client.get("/api/v1/tasks", headers={**auth, "X-Request-ID": "req-abc_123"})
+    assert res.status_code == 200
+    assert res.headers["X-Request-ID"] == "req-abc_123"
+    assert res.headers["X-Content-Type-Options"] == "nosniff"
+    assert res.headers["X-Frame-Options"] == "DENY"
+    assert res.headers["Referrer-Policy"] == "no-referrer"
+    assert res.headers["Cache-Control"] == "no-store"
+    assert "X-RateLimit-Limit" in res.headers
+    assert "X-RateLimit-Remaining" in res.headers
+    assert "X-RateLimit-Reset" in res.headers
+
+    # Rejeita X-Request-ID com caracteres inválidos e gera novo
+    bad = client.get("/health/live", headers={"X-Request-ID": "bad\nheader"})
+    assert bad.headers["X-Request-ID"] != "bad\nheader"
+    assert len(bad.headers["X-Request-ID"]) == 32
+
+
+def test_trust_proxy_headers_isolates_rate_limit():
+    app = create_app(make_settings(rate_limit_max_requests=1, trust_proxy_headers=True))
+    with TestClient(app) as c:
+        assert c.get("/health/live", headers={"X-Forwarded-For": "1.1.1.1"}).status_code == 200
+        assert c.get("/health/live", headers={"X-Forwarded-For": "1.1.1.1"}).status_code == 429
+        assert c.get("/health/live", headers={"X-Forwarded-For": "2.2.2.2"}).status_code == 200
+
+
+def test_rate_limiter_evicts_stale_keys():
+    limiter = RateLimiter(max_requests=2, window_seconds=10)
+    assert limiter.allow("old-ip", now=0)
+    assert limiter.allow("new-ip", now=20)
+    assert "old-ip" not in limiter._history
+
+
+def test_json_log_formatter():
+    import json
+
+    from app.core.logging import JsonFormatter
+
+    record = logging.LogRecord(
+        name="taskflow_api.http",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="GET /health | Status: %d",
+        args=(200,),
+        exc_info=None,
+    )
+    parsed = json.loads(JsonFormatter().format(record))
+    assert parsed["level"] == "INFO"
+    assert parsed["message"] == "GET /health | Status: 200"
+    assert "request_id" in parsed
+    assert "timestamp" in parsed
+
+
+def test_settings_extra_validation(monkeypatch):
+    monkeypatch.setenv("LOG_FORMAT", "xml")
+    with pytest.raises(ConfigError):
+        Settings.from_env()
+
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "maybe")
+    with pytest.raises(ConfigError):
+        Settings.from_env()
+
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "true")
+    monkeypatch.setenv("AUTO_CREATE_TABLES", "false")
+    s = Settings.from_env()
+    assert s.log_format == "json"
+    assert s.trust_proxy_headers is True
+    assert s.auto_create_tables is False

@@ -137,3 +137,94 @@ def test_stats(client, auth, create_project, create_task):
         "by_status": {"pendente": 2, "concluida": 1},
         "by_priority": {"media": 2, "alta": 1},
     }
+
+
+def test_completed_at_lifecycle(client, auth, create_task):
+    # Criada já concluída
+    done = create_task("Já feita", status="concluida")
+    assert done["completed_at"] is not None
+
+    # Criada pendente -> concluída -> reaberta
+    task = create_task("Em aberto")
+    assert task["completed_at"] is None
+    assert task["version"] == 1
+
+    patched = client.patch(
+        f"/api/v1/tasks/{task['id']}", json={"status": "concluida"}, headers=auth
+    ).json()
+    assert patched["completed_at"] is not None
+    assert patched["version"] == 2
+
+    reopened = client.patch(
+        f"/api/v1/tasks/{task['id']}", json={"status": "em_andamento"}, headers=auth
+    ).json()
+    assert reopened["completed_at"] is None
+    assert reopened["version"] == 3
+
+
+def test_optimistic_locking(client, auth, create_task):
+    task = create_task("Concorrente")
+    assert task["version"] == 1
+
+    # Versão correta -> 200 e incrementa
+    ok = client.patch(
+        f"/api/v1/tasks/{task['id']}",
+        json={"title": "Atualizada", "version": 1},
+        headers=auth,
+    )
+    assert ok.status_code == 200
+    assert ok.json()["version"] == 2
+
+    # Versão defasada -> 409 Conflict
+    stale = client.patch(
+        f"/api/v1/tasks/{task['id']}",
+        json={"title": "Sobrescrever", "version": 1},
+        headers=auth,
+    )
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "conflict"
+
+
+def test_sorting_and_date_filters(client, auth, create_task):
+    now = datetime.now(timezone.utc)
+    past = (now - timedelta(days=2)).isoformat()
+    soon = (now + timedelta(days=1)).isoformat()
+    later = (now + timedelta(days=5)).isoformat()
+
+    create_task("Bravo", priority="baixa", due_date=later)
+    create_task("Alpha", priority="urgente", due_date=past)
+    create_task("Charlie", priority="alta", due_date=soon)
+    create_task("Delta", priority="media")  # sem due_date
+
+    # Ordenação por prioridade (desc: urgente -> alta -> media -> baixa)
+    by_prio = client.get("/api/v1/tasks?sort_by=priority&sort_order=desc", headers=auth).json()[
+        "items"
+    ]
+    assert [t["priority"] for t in by_prio] == ["urgente", "alta", "media", "baixa"]
+
+    # Ordenação por due_date asc: NULLS LAST
+    by_due = client.get("/api/v1/tasks?sort_by=due_date&sort_order=asc", headers=auth).json()[
+        "items"
+    ]
+    assert [t["title"] for t in by_due] == ["Alpha", "Charlie", "Bravo", "Delta"]
+
+    # Ordenação por título asc
+    by_title = client.get("/api/v1/tasks?sort_by=title&sort_order=asc", headers=auth).json()[
+        "items"
+    ]
+    assert [t["title"] for t in by_title] == ["Alpha", "Bravo", "Charlie", "Delta"]
+
+    # Filtro overdue=true e overdue=false
+    overdue = client.get("/api/v1/tasks?overdue=true", headers=auth).json()
+    assert [t["title"] for t in overdue["items"]] == ["Alpha"]
+
+    not_overdue = client.get("/api/v1/tasks?overdue=false", headers=auth).json()
+    assert not_overdue["total"] == 3
+
+    # Intervalo due_after / due_before
+    ranged = client.get(
+        "/api/v1/tasks",
+        params={"due_after": now.isoformat(), "due_before": (now + timedelta(days=3)).isoformat()},
+        headers=auth,
+    ).json()
+    assert [t["title"] for t in ranged["items"]] == ["Charlie"]

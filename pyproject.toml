@@ -1,12 +1,20 @@
 [project]
 name = "taskflow-backend"
-version = "2.1.0"
+version = "2.2.0"
 requires-python = ">=3.10"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 90
 
 [tool.ruff]
 line-length = 100

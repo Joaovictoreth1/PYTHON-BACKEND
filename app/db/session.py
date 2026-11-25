@@ -19,20 +19,31 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+def _is_sqlite_memory(url: str) -> bool:
+    return url in ("sqlite://", "sqlite:///:memory:")
+
+
 def build_engine(database_url: str) -> Engine:
     kwargs: dict[str, Any] = {"hide_parameters": True}
     if _is_sqlite(database_url):
         kwargs["connect_args"] = {"check_same_thread": False}
-        if database_url in ("sqlite://", "sqlite:///:memory:"):
+        if _is_sqlite_memory(database_url):
             kwargs["poolclass"] = StaticPool
+    else:
+        kwargs["pool_pre_ping"] = True
+
     engine = create_engine(database_url, **kwargs)
 
     if _is_sqlite(database_url):
+        enable_wal = not _is_sqlite_memory(database_url)
 
         @event.listens_for(engine, "connect")
-        def _enable_foreign_keys(dbapi_connection: Any, _record: Any) -> None:
+        def _configure_sqlite(dbapi_connection: Any, _record: Any) -> None:
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
+            if enable_wal:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
 
     return engine

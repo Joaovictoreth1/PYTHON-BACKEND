@@ -13,7 +13,7 @@ from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RateLimiter, build_http_middleware
 from app.db.session import build_engine, build_session_factory, init_db
-from app.routers import health, projects, stats, tasks
+from app.routers import health, projects, stats, tags, tasks
 
 logger = get_logger()
 
@@ -21,10 +21,11 @@ logger = get_logger()
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings.log_format)
 
     engine = build_engine(settings.database_url)
-    init_db(engine)
+    if settings.auto_create_tables:
+        init_db(engine)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -34,7 +35,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="TaskFlow Backend API",
-        description="API RESTful corporativa com projetos, tarefas, métricas e rate limiting.",
+        description="API RESTful corporativa com projetos, tarefas, tags, comentários e métricas.",
         version=VERSION,
         docs_url="/docs",
         redoc_url="/redoc",
@@ -50,14 +51,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_origins=settings.cors_origins,
         allow_credentials=not allow_all,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "X-API-Key"],
-        expose_headers=["X-Process-Time-Ms"],
+        allow_headers=["Content-Type", "X-API-Key", "X-Request-ID"],
+        expose_headers=[
+            "X-Request-ID",
+            "X-Process-Time-Ms",
+            "X-RateLimit-Limit",
+            "X-RateLimit-Remaining",
+            "X-RateLimit-Reset",
+        ],
     )
     limiter = RateLimiter(settings.rate_limit_max_requests, settings.rate_limit_window_seconds)
-    app.middleware("http")(build_http_middleware(limiter))
+    app.middleware("http")(
+        build_http_middleware(limiter, trust_proxy_headers=settings.trust_proxy_headers)
+    )
 
     register_exception_handlers(app)
-    for router in (health.router, stats.router, projects.router, tasks.router):
+    for router in (health.router, stats.router, projects.router, tasks.router, tags.router):
         app.include_router(router)
 
     return app

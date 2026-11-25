@@ -18,3 +18,9 @@ class HealthResponse(BaseModel):
     version: str
     database: str
     timestamp: datetime
+
+
+class LivenessResponse(BaseModel):
+    status: str
+    version: str
+    timestamp: datetime
