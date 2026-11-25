@@ -1,4 +1,4 @@
-"""Middlewares de Request ID, rate limiting por IP, segurança e observabilidade."""
+"""Middlewares de Request ID, rate limiting (in-memory ou Redis com fallback) e segurança."""
 
 from __future__ import annotations
 
@@ -9,10 +9,13 @@ import uuid
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Protocol
 
+import redis
 from fastapi import Request, Response, status
 from fastapi.responses import JSONResponse
 
+from app.core.config import Settings
 from app.core.context import reset_request_id, set_request_id
 from app.core.logging import get_logger
 
@@ -30,6 +33,10 @@ class RateLimitResult:
     reset_seconds: int
 
 
+class RateLimiterProtocol(Protocol):
+    def check(self, key: str) -> RateLimitResult: ...
+
+
 class RateLimiter:
     """Janela deslizante em memória (por processo) com limpeza de chaves expiradas."""
 
@@ -40,10 +47,7 @@ class RateLimiter:
         self._last_eviction: float = 0.0
 
     def _evict_stale(self, now: float) -> None:
-        if (
-            len(self._history) < _EVICT_THRESHOLD
-            and now - self._last_eviction < self.window_seconds
-        ):
+        if len(self._history) < _EVICT_THRESHOLD and now - self._last_eviction < self.window_seconds:
             return
         self._last_eviction = now
         stale_keys = [
@@ -85,6 +89,73 @@ class RateLimiter:
         return self.check(key, now=now).allowed
 
 
+class RedisRateLimiter:
+    """Rate limiter distribuído em janela deslizante via Redis ZSET com fallback em memória."""
+
+    def __init__(
+        self,
+        redis_client: redis.Redis,
+        max_requests: int,
+        window_seconds: int,
+        fallback: RateLimiter | None = None,
+    ) -> None:
+        self._redis = redis_client
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._fallback = fallback or RateLimiter(max_requests, window_seconds)
+
+    def check(self, key: str) -> RateLimitResult:
+        now = time.time()
+        window_start = now - self.window_seconds
+        redis_key = f"taskflow:rl:{key}"
+        member = f"{now}:{uuid.uuid4().hex}"
+        try:
+            pipe = self._redis.pipeline()
+            pipe.zremrangebyscore(redis_key, 0, window_start)
+            pipe.zcard(redis_key)
+            _, current_count = pipe.execute()
+            count = int(current_count)
+            if count >= self.max_requests:
+                return RateLimitResult(
+                    allowed=False,
+                    limit=self.max_requests,
+                    remaining=0,
+                    reset_seconds=self.window_seconds,
+                )
+            write_pipe = self._redis.pipeline()
+            write_pipe.zadd(redis_key, {member: now})
+            write_pipe.expire(redis_key, self.window_seconds)
+            write_pipe.execute()
+            return RateLimitResult(
+                allowed=True,
+                limit=self.max_requests,
+                remaining=max(0, self.max_requests - count - 1),
+                reset_seconds=self.window_seconds,
+            )
+        except redis.RedisError:
+            logger.warning("Redis indisponível para rate limit; usando fallback em memória")
+            return self._fallback.check(key)
+
+
+def build_rate_limiter(settings: Settings) -> RateLimiterProtocol:
+    fallback = RateLimiter(settings.rate_limit_max_requests, settings.rate_limit_window_seconds)
+    if not settings.redis_url:
+        return fallback
+    client = redis.Redis.from_url(
+        settings.redis_url,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+        decode_responses=True,
+    )
+    logger.info("Rate limiter configurado com Redis (fallback em memória ativo)")
+    return RedisRateLimiter(
+        redis_client=client,
+        max_requests=settings.rate_limit_max_requests,
+        window_seconds=settings.rate_limit_window_seconds,
+        fallback=fallback,
+    )
+
+
 def _resolve_request_id(request: Request) -> str:
     incoming = request.headers.get("X-Request-ID", "").strip()
     if incoming and _SAFE_REQUEST_ID.match(incoming):
@@ -120,7 +191,7 @@ def _apply_common_headers(
 
 
 def build_http_middleware(
-    limiter: RateLimiter,
+    limiter: RateLimiterProtocol,
     trust_proxy_headers: bool = False,
 ) -> Callable[[Request, Callable[[Request], Awaitable[Response]]], Awaitable[Response]]:
     async def middleware(
