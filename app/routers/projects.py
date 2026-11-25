@@ -49,8 +49,6 @@ def update_project(
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_project(
-    project_id: ProjectId, current_user: CurrentUser, service: Service
-) -> Response:
+def delete_project(project_id: ProjectId, current_user: CurrentUser, service: Service) -> Response:
     service.delete(current_user.id, project_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

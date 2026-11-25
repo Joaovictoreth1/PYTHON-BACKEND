@@ -35,7 +35,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="TaskFlow Backend API",
-        description="API RESTful multi-tenant com autenticação JWT, projetos, tarefas e exportações.",
+        description="API multi-tenant com autenticação JWT, projetos, tarefas e exportações.",
         version=VERSION,
         docs_url="/docs",
         redoc_url="/redoc",

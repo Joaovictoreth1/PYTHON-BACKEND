@@ -15,9 +15,7 @@ TagId = Annotated[int, Path(ge=1)]
 
 
 @router.post("", response_model=TagResponse, status_code=status.HTTP_201_CREATED)
-def create_tag(
-    tag_in: TagCreate, current_user: CurrentUser, service: Service
-) -> TagResponse:
+def create_tag(tag_in: TagCreate, current_user: CurrentUser, service: Service) -> TagResponse:
     return service.create(current_user.id, tag_in)
 
 

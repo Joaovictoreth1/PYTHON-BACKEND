@@ -29,9 +29,7 @@ CommentId = Annotated[int, Path(ge=1)]
 
 
 @router.post("", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
-def create_task(
-    task_in: TaskCreate, current_user: CurrentUser, service: Service
-) -> TaskResponse:
+def create_task(task_in: TaskCreate, current_user: CurrentUser, service: Service) -> TaskResponse:
     return service.create(current_user.id, task_in)
 
 

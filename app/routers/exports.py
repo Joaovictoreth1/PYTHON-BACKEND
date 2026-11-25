@@ -45,16 +45,12 @@ def list_exports(
 
 
 @router.get("/{export_id}", response_model=ExportResponse)
-def get_export(
-    export_id: ExportId, current_user: CurrentUser, service: Service
-) -> ExportResponse:
+def get_export(export_id: ExportId, current_user: CurrentUser, service: Service) -> ExportResponse:
     return service.get(current_user.id, export_id)
 
 
 @router.get("/{export_id}/download")
-def download_export(
-    export_id: ExportId, current_user: CurrentUser, service: Service
-) -> Response:
+def download_export(export_id: ExportId, current_user: CurrentUser, service: Service) -> Response:
     media_type, filename, content = service.download(current_user.id, export_id)
     return Response(
         content=content,

@@ -33,9 +33,7 @@ class ProjectService:
             raise NotFoundError("Projeto não encontrado.")
         return project
 
-    def _ensure_unique_name(
-        self, user_id: int, name: str, current_id: int | None = None
-    ) -> None:
+    def _ensure_unique_name(self, user_id: int, name: str, current_id: int | None = None) -> None:
         existing = self.repo.get_by_name(user_id, name)
         if existing is not None and existing.id != current_id:
             raise ConflictError(f"Já existe um projeto chamado '{name}'.")
@@ -48,8 +46,7 @@ class ProjectService:
 
     def list(self, user_id: int, skip: int, limit: int) -> list[ProjectResponse]:
         return [
-            _to_response(p, c)
-            for p, c in self.repo.list_with_task_counts(user_id, skip, limit)
+            _to_response(p, c) for p, c in self.repo.list_with_task_counts(user_id, skip, limit)
         ]
 
     def get(self, user_id: int, project_id: int) -> ProjectResponse:

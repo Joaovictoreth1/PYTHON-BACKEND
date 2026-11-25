@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response, status
+from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
 from app.db.session import get_db
@@ -16,7 +17,6 @@ from app.schemas.auth import (
     UserResponse,
 )
 from app.services.auth_service import AuthService
-from sqlalchemy.orm import Session
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Autenticação"])
 

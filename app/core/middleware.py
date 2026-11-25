@@ -47,7 +47,10 @@ class RateLimiter:
         self._last_eviction: float = 0.0
 
     def _evict_stale(self, now: float) -> None:
-        if len(self._history) < _EVICT_THRESHOLD and now - self._last_eviction < self.window_seconds:
+        if (
+            len(self._history) < _EVICT_THRESHOLD
+            and now - self._last_eviction < self.window_seconds
+        ):
             return
         self._last_eviction = now
         stale_keys = [

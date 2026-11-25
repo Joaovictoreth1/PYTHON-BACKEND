@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+from collections.abc import Sequence
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -18,7 +19,7 @@ from app.schemas.export import ExportResponse
 logger = get_logger("exports")
 
 
-def _serialize_tasks(tasks: list[TaskModel], fmt: ExportFormat) -> str:
+def _serialize_tasks(tasks: Sequence[TaskModel], fmt: ExportFormat) -> str:
     rows = [
         {
             "id": t.id,
@@ -58,9 +59,7 @@ def _serialize_tasks(tasks: list[TaskModel], fmt: ExportFormat) -> str:
     return buf.getvalue()
 
 
-def run_export_job(
-    session_factory: sessionmaker[Session], export_id: int, user_id: int
-) -> None:
+def run_export_job(session_factory: sessionmaker[Session], export_id: int, user_id: int) -> None:
     """Executa geração da exportação em sessão própria (background task)."""
     db = session_factory()
     try:
@@ -105,7 +104,9 @@ class ExportService:
         if job is None:
             raise NotFoundError(f"Exportação {export_id} não encontrada.")
         if job.status != ExportStatus.COMPLETED or job.content is None:
-            raise ConflictError(f"Exportação {export_id} ainda não está pronta ({job.status.value}).")
+            raise ConflictError(
+                f"Exportação {export_id} ainda não está pronta ({job.status.value})."
+            )
         if job.export_format == ExportFormat.JSON:
             return "application/json", f"tasks-{job.id}.json", job.content
         return "text/csv; charset=utf-8", f"tasks-{job.id}.csv", job.content

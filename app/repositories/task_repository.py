@@ -72,9 +72,7 @@ class TaskRepository:
         )
         return self.db.scalar(stmt)
 
-    def _apply_filters(
-        self, stmt: Select[Any], user_id: int, filters: TaskFilters
-    ) -> Select[Any]:
+    def _apply_filters(self, stmt: Select[Any], user_id: int, filters: TaskFilters) -> Select[Any]:
         stmt = stmt.where(TaskModel.user_id == user_id)
         if filters.status:
             stmt = stmt.where(TaskModel.status == filters.status)
@@ -137,7 +135,7 @@ class TaskRepository:
         )
         return total, list(self.db.scalars(items_stmt).all())
 
-    def list_all_for_user(self, user_id: int) -> list[TaskModel]:
+    def list_all_for_user(self, user_id: int) -> Sequence[TaskModel]:
         stmt = (
             select(TaskModel)
             .options(selectinload(TaskModel.tags))
