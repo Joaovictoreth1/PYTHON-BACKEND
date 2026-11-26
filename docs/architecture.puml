@@ -1,0 +1,25 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/v2.12.0/C4_Container.puml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/v2.12.0/C4_Component.puml
+!pragma layout smetana
+LAYOUT_LEFT_RIGHT()
+title TaskFlow Backend API — runtime and components
+
+Person(user, "API consumer", "Uses Swagger or an HTTP client")
+
+System_Boundary(taskflow, "TaskFlow Backend") {
+    Container_Boundary(api, "TaskFlow API [Python / FastAPI]") {
+        Component(middleware, "Request middleware", "FastAPI", "CORS, IP rate limit, and request timing")
+        Component(routes, "REST endpoints", "FastAPI", "Health, projects, tasks, and metrics")
+        Component(auth, "API key dependency", "FastAPI", "Authenticates business endpoints")
+        Component(db, "Persistence", "SQLAlchemy", "Per-request sessions, models and queries")
+    }
+    ContainerDb(store, "TaskFlow database", "SQLite", "Projects and tasks with cascading delete")
+}
+
+Rel(user, middleware, "Sends API requests", "HTTP / JSON")
+Rel(middleware, routes, "Dispatches")
+Rel(routes, auth, "Checks X-API-Key on /api/v1")
+Rel(routes, db, "Reads and writes")
+Rel(db, store, "Executes SQL")
+@enduml
