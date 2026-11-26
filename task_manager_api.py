@@ -1,409 +1,124 @@
-"""
-TaskFlow Backend API v2.0
-=========================
-API RESTful profissional construída com FastAPI, SQLAlchemy (SQLite) e Pydantic v2.
-
-Recursos incluídos:
-- Arquitetura relacional (Projetos 1:N Tarefas) com exclusão em cascata.
-- Segurança via X-API-Key com comparação em tempo constante (secrets.compare_digest).
-- Middleware de Rate Limiting por IP e Observabilidade (tempo de resposta nos headers).
-- Paginação, filtros combinados, busca textual e endpoint de métricas (/api/v1/stats).
-- Suíte de testes automatizados integrada (roda ao executar `python task_manager_api.py`).
-"""
+"""TaskFlow REST API for projects, tasks, and metrics."""
 
 import logging
-import os
 import secrets
-import sys
+import sqlite3
 import time
-from collections import defaultdict
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Dict, Generator, List, Optional
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager
+from typing import Annotated, cast
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import (
-    Column,
-    DateTime,
-    Enum as SQLEnum,
-    ForeignKey,
-    Integer,
-    String,
-    Text,
-    create_engine,
-    func,
-    text,
+from fastapi.responses import JSONResponse, Response
+from fastapi.security import APIKeyHeader
+from sqlalchemy import create_engine, event, func, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from taskflow_config import Settings
+from taskflow_models import (
+    Base,
+    HealthResponse,
+    PaginatedTaskResponse,
+    ProjectCreate,
+    ProjectModel,
+    ProjectResponse,
+    StatsResponse,
+    TaskCreate,
+    TaskModel,
+    TaskPriority,
+    TaskResponse,
+    TaskStatus,
+    TaskUpdate,
+    utc_now,
 )
-from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
+from taskflow_rate_limit import RateLimiter
 
-# ==============================================================================
-# 1. LOGGING E CONFIGURAÇÕES GERAIS
-# ==============================================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("taskflow_api")
-
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./taskflow_v2.db")
-API_SECRET_KEY = os.getenv("API_SECRET_KEY", "dev-secret-key-2026")
-RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "120"))
-RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
-
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
-    echo=False,
-)
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+logger = logging.getLogger("uvicorn.error").getChild("taskflow")
+router = APIRouter()
+PathId = Annotated[int, Path(gt=0)]
 
 
-# ==============================================================================
-# 2. ENUMS E MODELOS RELACIONAIS (ORM)
-# ==============================================================================
-
-class TaskStatus(str, Enum):
-    PENDENTE = "pendente"
-    EM_ANDAMENTO = "em_andamento"
-    REVISAO = "revisao"
-    CONCLUIDA = "concluida"
-    CANCELADA = "cancelada"
-
-
-class TaskPriority(str, Enum):
-    BAIXA = "baixa"
-    MEDIA = "media"
-    ALTA = "alta"
-    URGENTE = "urgente"
-
-
-class ProjectModel(Base):
-    """Tabela de projetos que agrupam múltiplas tarefas (Relacionamento 1:N)."""
-    __tablename__ = "projects"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    name = Column(String(120), nullable=False, unique=True, index=True)
-    description = Column(Text, nullable=True)
-    created_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        nullable=False,
-    )
-
-    tasks = relationship(
-        "TaskModel",
-        back_populates="project",
-        cascade="all, delete-orphan",
-    )
-
-
-class TaskModel(Base):
-    """Tabela principal de tarefas."""
-    __tablename__ = "tasks"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    project_id = Column(
-        Integer,
-        ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=True,
-        index=True,
-    )
-    title = Column(String(150), nullable=False, index=True)
-    description = Column(Text, nullable=True)
-    status = Column(
-        SQLEnum(TaskStatus),
-        default=TaskStatus.PENDENTE,
-        nullable=False,
-        index=True,
-    )
-    priority = Column(
-        SQLEnum(TaskPriority),
-        default=TaskPriority.MEDIA,
-        nullable=False,
-        index=True,
-    )
-    assignee = Column(String(100), nullable=True, index=True)
-    due_date = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        nullable=False,
-    )
-    updated_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
-        nullable=False,
-    )
-
-    project = relationship("ProjectModel", back_populates="tasks")
-
-
-Base.metadata.create_all(bind=engine)
-
-
-# ==============================================================================
-# 3. SCHEMAS PYDANTIC v2 (VALIDAÇÃO E SERIALIZAÇÃO)
-# ==============================================================================
-
-class ProjectCreate(BaseModel):
-    name: str = Field(..., min_length=3, max_length=120, description="Nome único do projeto")
-    description: Optional[str] = Field(None, max_length=1000, description="Descrição do escopo")
-
-    @field_validator("name")
-    @classmethod
-    def clean_name(cls, v: str) -> str:
-        return v.strip()
-
-
-class ProjectResponse(BaseModel):
-    id: int
-    name: str
-    description: Optional[str]
-    created_at: datetime
-    task_count: int = 0
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class TaskBase(BaseModel):
-    title: str = Field(..., min_length=3, max_length=150, description="Título da tarefa")
-    description: Optional[str] = Field(None, max_length=2000, description="Detalhes técnicos")
-    status: TaskStatus = Field(default=TaskStatus.PENDENTE)
-    priority: TaskPriority = Field(default=TaskPriority.MEDIA)
-    assignee: Optional[str] = Field(None, max_length=100, description="Responsável")
-    due_date: Optional[datetime] = Field(None, description="Prazo final em formato ISO 8601")
-    project_id: Optional[int] = Field(None, description="ID do projeto associado")
-
-    @field_validator("title", "assignee")
-    @classmethod
-    def strip_whitespace(cls, v: Optional[str]) -> Optional[str]:
-        return v.strip() if isinstance(v, str) else v
-
-
-class TaskCreate(TaskBase):
-    pass
-
-
-class TaskUpdate(BaseModel):
-    title: Optional[str] = Field(None, min_length=3, max_length=150)
-    description: Optional[str] = Field(None, max_length=2000)
-    status: Optional[TaskStatus] = None
-    priority: Optional[TaskPriority] = None
-    assignee: Optional[str] = Field(None, max_length=100)
-    due_date: Optional[datetime] = None
-    project_id: Optional[int] = None
-
-
-class TaskResponse(TaskBase):
-    id: int
-    created_at: datetime
-    updated_at: datetime
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class PaginatedTaskResponse(BaseModel):
-    total: int
-    skip: int
-    limit: int
-    items: List[TaskResponse]
-
-
-class StatsResponse(BaseModel):
-    total_projects: int
-    total_tasks: int
-    overdue_tasks: int
-    by_status: Dict[str, int]
-    by_priority: Dict[str, int]
-
-
-class HealthResponse(BaseModel):
-    status: str
-    version: str
-    database: str
-    timestamp: datetime
-
-
-# ==============================================================================
-# 4. DEPENDÊNCIAS (SESSÃO DB E SEGURANÇA)
-# ==============================================================================
-
-def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
-    try:
+def get_db(request: Request) -> Iterator[Session]:
+    sessions = cast("sessionmaker[Session]", request.app.state.sessions)
+    with sessions() as db:
         yield db
-    finally:
-        db.close()
 
 
-def verify_api_key(x_api_key: str = Header(..., description="Chave secreta X-API-Key")):
-    """Valida a chave da API em tempo constante para prevenir timing attacks."""
-    if not secrets.compare_digest(x_api_key, API_SECRET_KEY):
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def verify_api_key(request: Request, key: Annotated[str | None, Depends(api_key_header)]) -> None:
+    configured_key = cast("bytes", request.app.state.api_secret_key)
+    if key is None or not secrets.compare_digest(key.encode("utf-8"), configured_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Chave de API (X-API-Key) inválida.",
-        )
-    return x_api_key
-
-
-# ==============================================================================
-# 5. APLICAÇÃO FASTAPI E MIDDLEWARES (OBSERVABILIDADE + RATE LIMIT)
-# ==============================================================================
-
-app = FastAPI(
-    title="TaskFlow Backend API",
-    description="API RESTful corporativa com projetos, tarefas, métricas e rate limiting.",
-    version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-_request_history: Dict[str, List[float]] = defaultdict(list)
-
-
-@app.middleware("http")
-async def observability_and_rate_limit_middleware(request: Request, call_next):
-    """Controla limite de requisições por IP e mede tempo de resposta."""
-    client_ip = request.client.host if request.client else "unknown"
-    now = time.time()
-
-    # Limpa registros fora da janela de tempo
-    _request_history[client_ip] = [
-        ts for ts in _request_history[client_ip] if now - ts < RATE_LIMIT_WINDOW_SECONDS
-    ]
-
-    if len(_request_history[client_ip]) >= RATE_LIMIT_MAX_REQUESTS:
-        return JSONResponse(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"detail": "Limite de requisições excedido. Tente novamente em instantes."},
+            detail="Chave de API (X-API-Key) ausente ou inválida.",
+            headers={"WWW-Authenticate": "APIKey"},
         )
 
-    _request_history[client_ip].append(now)
 
-    start_time = time.perf_counter()
-    response = await call_next(request)
-    elapsed_ms = (time.perf_counter() - start_time) * 1000
-
-    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
-    logger.info(
-        "%s %s | Status: %d | IP: %s | Tempo: %.2fms",
-        request.method,
-        request.url.path,
-        response.status_code,
-        client_ip,
-        elapsed_ms,
-    )
-    return response
+DbSession = Annotated[Session, Depends(get_db)]
+protected = APIRouter(prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error("Erro não tratado em %s: %s", request.url.path, str(exc))
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"error": "Erro interno no servidor", "path": request.url.path},
-    )
-
-
-# ==============================================================================
-# 6. ROTAS DE MONITORAMENTO E MÉTRICAS
-# ==============================================================================
-
-@app.get("/health", response_model=HealthResponse, tags=["Monitoramento"])
-def health_check(db: Session = Depends(get_db)):
-    """Verifica disponibilidade da API e conexão com o banco."""
-    db.execute(text("SELECT 1"))
+@router.get("/health", tags=["Monitoramento"])
+def health_check(db: DbSession) -> HealthResponse:
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        logger.warning("database_health_check_failed")
+        raise HTTPException(status_code=503, detail="Banco de dados indisponível.") from None
     return HealthResponse(
-        status="online",
-        version="2.0.0",
-        database="conectado",
-        timestamp=datetime.now(timezone.utc),
+        status="online", version="2.0.0", database="conectado", timestamp=utc_now()
     )
 
 
-@app.get(
-    "/api/v1/stats",
-    response_model=StatsResponse,
-    tags=["Monitoramento"],
-    dependencies=[Depends(verify_api_key)],
-)
-def get_dashboard_stats(db: Session = Depends(get_db)):
-    """Retorna indicadores consolidados de projetos e tarefas."""
-    total_projects = db.query(func.count(ProjectModel.id)).scalar() or 0
-    total_tasks = db.query(func.count(TaskModel.id)).scalar() or 0
-
-    now_utc = datetime.now(timezone.utc)
+@protected.get("/stats", tags=["Monitoramento"])
+def get_dashboard_stats(db: DbSession) -> StatsResponse:
+    total_projects = db.scalar(select(func.count(ProjectModel.id))) or 0
+    total_tasks = db.scalar(select(func.count(TaskModel.id))) or 0
     overdue_tasks = (
-        db.query(func.count(TaskModel.id))
-        .filter(
-            TaskModel.due_date.isnot(None),
-            TaskModel.due_date < now_utc,
-            TaskModel.status.notin_([TaskStatus.CONCLUIDA, TaskStatus.CANCELADA]),
+        db.scalar(
+            select(func.count(TaskModel.id)).where(
+                TaskModel.due_date < utc_now(),
+                TaskModel.status.notin_([TaskStatus.CONCLUIDA, TaskStatus.CANCELADA]),
+            )
         )
-        .scalar()
         or 0
     )
-
-    status_rows = (
-        db.query(TaskModel.status, func.count(TaskModel.id))
-        .group_by(TaskModel.status)
-        .all()
+    statuses = db.execute(
+        select(TaskModel.status, func.count(TaskModel.id)).group_by(TaskModel.status)
     )
-    priority_rows = (
-        db.query(TaskModel.priority, func.count(TaskModel.id))
-        .group_by(TaskModel.priority)
-        .all()
+    priorities = db.execute(
+        select(TaskModel.priority, func.count(TaskModel.id)).group_by(TaskModel.priority)
     )
-
     return StatsResponse(
         total_projects=total_projects,
         total_tasks=total_tasks,
         overdue_tasks=overdue_tasks,
-        by_status={row[0].value: row[1] for row in status_rows},
-        by_priority={row[0].value: row[1] for row in priority_rows},
+        by_status={task_status.value: count for task_status, count in statuses},
+        by_priority={priority.value: count for priority, count in priorities},
     )
 
 
-# ==============================================================================
-# 7. ROTAS DE PROJETOS (CRUD)
-# ==============================================================================
-
-@app.post(
-    "/api/v1/projects",
-    response_model=ProjectResponse,
-    status_code=status.HTTP_201_CREATED,
-    tags=["Projetos"],
-    dependencies=[Depends(verify_api_key)],
-)
-def create_project(project_in: ProjectCreate, db: Session = Depends(get_db)):
-    existing = db.query(ProjectModel).filter(ProjectModel.name == project_in.name).first()
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Já existe um projeto chamado '{project_in.name}'.",
-        )
-
+@protected.post("/projects", status_code=status.HTTP_201_CREATED, tags=["Projetos"])
+def create_project(project_in: ProjectCreate, db: DbSession) -> ProjectResponse:
     project = ProjectModel(**project_in.model_dump())
     db.add(project)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if db.scalar(select(ProjectModel.id).where(ProjectModel.name == project_in.name)) is None:
+            raise
+        raise HTTPException(
+            status_code=409, detail=f"Já existe um projeto chamado '{project_in.name}'."
+        ) from None
     db.refresh(project)
-
     return ProjectResponse(
         id=project.id,
         name=project.name,
@@ -413,229 +128,184 @@ def create_project(project_in: ProjectCreate, db: Session = Depends(get_db)):
     )
 
 
-@app.get(
-    "/api/v1/projects",
-    response_model=List[ProjectResponse],
-    tags=["Projetos"],
-    dependencies=[Depends(verify_api_key)],
-)
-def list_projects(db: Session = Depends(get_db)):
-    projects = db.query(ProjectModel).order_by(ProjectModel.created_at.desc()).all()
+@protected.get("/projects", tags=["Projetos"])
+def list_projects(db: DbSession) -> list[ProjectResponse]:
+    counts = (
+        select(TaskModel.project_id, func.count(TaskModel.id).label("task_count"))
+        .where(TaskModel.project_id.is_not(None))
+        .group_by(TaskModel.project_id)
+        .subquery()
+    )
+    projects = db.execute(
+        select(ProjectModel, func.coalesce(counts.c.task_count, 0))
+        .outerjoin(counts, ProjectModel.id == counts.c.project_id)
+        .order_by(ProjectModel.created_at.desc(), ProjectModel.id.desc())
+    )
     return [
         ProjectResponse(
-            id=p.id,
-            name=p.name,
-            description=p.description,
-            created_at=p.created_at,
-            task_count=len(p.tasks),
+            id=project.id,
+            name=project.name,
+            description=project.description,
+            created_at=project.created_at,
+            task_count=count,
         )
-        for p in projects
+        for project, count in projects
     ]
 
 
-@app.delete(
-    "/api/v1/projects/{project_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    tags=["Projetos"],
-    dependencies=[Depends(verify_api_key)],
+def require_project(db: Session, project_id: int) -> ProjectModel:
+    project = db.get(ProjectModel, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"Projeto ID {project_id} não encontrado.")
+    return project
+
+
+@protected.delete(
+    "/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Projetos"]
 )
-def delete_project(project_id: int, db: Session = Depends(get_db)):
-    project = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Projeto não encontrado.")
-    db.delete(project)
+def delete_project(project_id: PathId, db: DbSession) -> None:
+    db.delete(require_project(db, project_id))
     db.commit()
-    return None
 
 
-# ==============================================================================
-# 8. ROTAS DE TAREFAS (CRUD + FILTROS + PAGINAÇÃO)
-# ==============================================================================
-
-@app.post(
-    "/api/v1/tasks",
-    response_model=TaskResponse,
-    status_code=status.HTTP_201_CREATED,
-    tags=["Tarefas"],
-    dependencies=[Depends(verify_api_key)],
+@protected.post(
+    "/tasks", status_code=status.HTTP_201_CREATED, response_model=TaskResponse, tags=["Tarefas"]
 )
-def create_task(task_in: TaskCreate, db: Session = Depends(get_db)):
+def create_task(task_in: TaskCreate, db: DbSession) -> TaskModel:
     if task_in.project_id is not None:
-        project = db.query(ProjectModel).filter(ProjectModel.id == task_in.project_id).first()
-        if not project:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Projeto ID {task_in.project_id} não encontrado.",
-            )
-
-    new_task = TaskModel(**task_in.model_dump())
-    db.add(new_task)
-    db.commit()
-    db.refresh(new_task)
-    return new_task
-
-
-@app.get(
-    "/api/v1/tasks",
-    response_model=PaginatedTaskResponse,
-    tags=["Tarefas"],
-    dependencies=[Depends(verify_api_key)],
-)
-def list_tasks(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
-    status_filter: Optional[TaskStatus] = Query(None, alias="status"),
-    priority_filter: Optional[TaskPriority] = Query(None, alias="priority"),
-    project_id: Optional[int] = Query(None),
-    assignee: Optional[str] = Query(None),
-    search: Optional[str] = Query(None, min_length=2),
-    db: Session = Depends(get_db),
-):
-    query = db.query(TaskModel)
-
-    if status_filter:
-        query = query.filter(TaskModel.status == status_filter)
-    if priority_filter:
-        query = query.filter(TaskModel.priority == priority_filter)
-    if project_id is not None:
-        query = query.filter(TaskModel.project_id == project_id)
-    if assignee:
-        query = query.filter(TaskModel.assignee.ilike(f"%{assignee}%"))
-    if search:
-        query = query.filter(TaskModel.title.ilike(f"%{search}%"))
-
-    total = query.count()
-    items = query.order_by(TaskModel.created_at.desc()).offset(skip).limit(limit).all()
-
-    return PaginatedTaskResponse(total=total, skip=skip, limit=limit, items=items)
-
-
-@app.get(
-    "/api/v1/tasks/{task_id}",
-    response_model=TaskResponse,
-    tags=["Tarefas"],
-    dependencies=[Depends(verify_api_key)],
-)
-def get_task(task_id: int, db: Session = Depends(get_db)):
-    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada.")
-    return task
-
-
-@app.patch(
-    "/api/v1/tasks/{task_id}",
-    response_model=TaskResponse,
-    tags=["Tarefas"],
-    dependencies=[Depends(verify_api_key)],
-)
-def update_task(task_id: int, task_in: TaskUpdate, db: Session = Depends(get_db)):
-    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada.")
-
-    update_data = task_in.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(task, field, value)
-
-    task.updated_at = datetime.now(timezone.utc)
+        require_project(db, task_in.project_id)
+    task = TaskModel(**task_in.model_dump())
+    db.add(task)
     db.commit()
     db.refresh(task)
     return task
 
 
-@app.delete(
-    "/api/v1/tasks/{task_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    tags=["Tarefas"],
-    dependencies=[Depends(verify_api_key)],
-)
-def delete_task(task_id: int, db: Session = Depends(get_db)):
-    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
-    if not task:
+@protected.get("/tasks", tags=["Tarefas"])
+def list_tasks(
+    db: DbSession,
+    skip: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 10,
+    status_filter: Annotated[TaskStatus | None, Query(alias="status")] = None,
+    priority_filter: Annotated[TaskPriority | None, Query(alias="priority")] = None,
+    project_id: Annotated[int | None, Query(gt=0)] = None,
+    assignee: Annotated[str | None, Query(min_length=1, max_length=100)] = None,
+    search: Annotated[str | None, Query(min_length=2, max_length=150)] = None,
+) -> PaginatedTaskResponse:
+    query = select(TaskModel)
+    if status_filter is not None:
+        query = query.where(TaskModel.status == status_filter)
+    if priority_filter is not None:
+        query = query.where(TaskModel.priority == priority_filter)
+    if project_id is not None:
+        query = query.where(TaskModel.project_id == project_id)
+    if assignee is not None:
+        query = query.where(TaskModel.assignee.icontains(assignee, autoescape=True))
+    if search is not None:
+        query = query.where(TaskModel.title.icontains(search, autoescape=True))
+
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    items = db.scalars(
+        query.order_by(TaskModel.created_at.desc(), TaskModel.id.desc()).offset(skip).limit(limit)
+    )
+    return PaginatedTaskResponse(
+        total=total,
+        skip=skip,
+        limit=limit,
+        items=[TaskResponse.model_validate(item) for item in items],
+    )
+
+
+@protected.get("/tasks/{task_id}", response_model=TaskResponse, tags=["Tarefas"])
+def get_task(task_id: PathId, db: DbSession) -> TaskModel:
+    task = db.get(TaskModel, task_id)
+    if task is None:
         raise HTTPException(status_code=404, detail=f"Tarefa {task_id} não encontrada.")
-    db.delete(task)
+    return task
+
+
+@protected.patch("/tasks/{task_id}", response_model=TaskResponse, tags=["Tarefas"])
+def update_task(task_id: PathId, task_in: TaskUpdate, db: DbSession) -> TaskModel:
+    task = get_task(task_id, db)
+    project_id = task_in.get("project_id")
+    if project_id is not None:
+        require_project(db, project_id)
+    if task_in:
+        for field, value in task_in.items():
+            setattr(task, field, value)
+        db.commit()
+        db.refresh(task)
+    return task
+
+
+@protected.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Tarefas"])
+def delete_task(task_id: PathId, db: DbSession) -> None:
+    db.delete(get_task(task_id, db))
     db.commit()
-    return None
 
 
-# ==============================================================================
-# 9. SUÍTE DE TESTES AUTOMATIZADOS INTEGRADA
-# ==============================================================================
+def create_app(settings: Settings | None = None) -> FastAPI:
+    config = settings if settings is not None else Settings.from_env()
+    limiter = RateLimiter(config.rate_limit_max_requests, config.rate_limit_window_seconds)
 
-def run_integration_tests():
-    from fastapi.testclient import TestClient
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        url = make_url(config.database_url)
+        sqlite = url.get_backend_name() == "sqlite"
+        engine = create_engine(
+            url,
+            connect_args={"check_same_thread": False} if sqlite else {},
+            poolclass=StaticPool if sqlite and url.database in (None, "", ":memory:") else None,
+        )
+        if sqlite:
 
-    print("\n=== Executando Suíte de Testes TaskFlow API v2.0 ===\n")
-    client = TestClient(app)
-    headers = {"X-API-Key": API_SECRET_KEY}
+            @event.listens_for(engine, "connect")
+            def enable_foreign_keys(connection: sqlite3.Connection, _record: object) -> None:
+                connection.execute("PRAGMA foreign_keys = ON").close()
 
-    # 1. Health Check
-    res = client.get("/health")
-    assert res.status_code == 200
-    assert "X-Process-Time-Ms" in res.headers
-    print(f"[OK] 1. Health Check operacional (Tempo: {res.headers['X-Process-Time-Ms']}ms)")
+        try:
+            Base.metadata.create_all(engine)
+            app.state.sessions = sessionmaker(engine)
+            yield
+        finally:
+            engine.dispose()
 
-    # 2. Bloqueio de segurança
-    res_unauth = client.get("/api/v1/tasks", headers={"X-API-Key": "chave-errada"})
-    assert res_unauth.status_code == 401
-    print("[OK] 2. Segurança X-API-Key validada.")
+    app = FastAPI(title="TaskFlow Backend API", version="2.0.0", lifespan=lifespan)
+    app.state.api_secret_key = config.api_secret_key.encode("ascii")
+    app.include_router(router)
+    app.include_router(protected)
 
-    # 3. Criação de Projeto
-    proj_name = f"Plataforma Core {int(time.time())}"
-    res_proj = client.post(
-        "/api/v1/projects",
-        json={"name": proj_name, "description": "Infraestrutura backend"},
-        headers=headers,
+    @app.middleware("http")
+    async def observe_and_throttle(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        start = time.monotonic()
+        client = request.client.host if request.client else "unknown"
+        if request.url.path != "/health" and not limiter.allow(client, start):
+            response: Response = JSONResponse(
+                status_code=429, content={"detail": "Limite de requisições excedido."}
+            )
+        else:
+            response = await call_next(request)
+        elapsed_ms = (time.monotonic() - start) * 1000
+        response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
+        logger.info(
+            "request method=%s status=%d duration_ms=%.2f",
+            request.method,
+            response.status_code,
+            elapsed_ms,
+        )
+        return response
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        logger.error("request_failed method=%s exception=%s", request.method, type(exc).__name__)
+        return JSONResponse(status_code=500, content={"detail": "Erro interno no servidor"})
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(config.cors_allowed_origins),
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
+        allow_headers=["X-API-Key", "Content-Type"],
     )
-    assert res_proj.status_code == 201
-    project_id = res_proj.json()["id"]
-    print(f"[OK] 3. Projeto criado (ID: {project_id} | Nome: '{proj_name}')")
-
-    # 4. Criação de Tarefa associada ao Projeto
-    res_task = client.post(
-        "/api/v1/tasks",
-        json={
-            "title": "Configurar pipeline CI/CD",
-            "priority": "urgente",
-            "assignee": "João Victor",
-            "project_id": project_id,
-        },
-        headers=headers,
-    )
-    assert res_task.status_code == 201
-    task_id = res_task.json()["id"]
-    print(f"[OK] 4. Tarefa criada no projeto (ID: {task_id})")
-
-    # 5. Endpoint de Métricas
-    res_stats = client.get("/api/v1/stats", headers=headers)
-    assert res_stats.status_code == 200
-    print(f"[OK] 5. Dashboard de métricas: {res_stats.json()}")
-
-    # 6. Atualização parcial
-    res_patch = client.patch(
-        f"/api/v1/tasks/{task_id}",
-        json={"status": "concluida"},
-        headers=headers,
-    )
-    assert res_patch.status_code == 200
-    assert res_patch.json()["status"] == "concluida"
-    print("[OK] 6. Tarefa atualizada para 'concluida'.")
-
-    # 7. Exclusão em cascata do Projeto
-    res_del = client.delete(f"/api/v1/projects/{project_id}", headers=headers)
-    assert res_del.status_code == 204
-    res_check = client.get(f"/api/v1/tasks/{task_id}", headers=headers)
-    assert res_check.status_code == 404
-    print("[OK] 7. Exclusão em cascata (Projeto -> Tarefas) validada.")
-
-    print("\nTodos os 7 testes passaram! Para iniciar o servidor web:")
-    print("uvicorn task_manager_api:app --reload\n")
-
-
-if __name__ == "__main__":
-    try:
-        run_integration_tests()
-    except ImportError as exc:
-        print(f"Erro: dependência ausente ({exc}). Instale com: pip install -r requirements.txt")
-        sys.exit(1)
+    return app
