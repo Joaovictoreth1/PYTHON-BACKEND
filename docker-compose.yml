@@ -1,0 +1,36 @@
+x-taskflow: &taskflow
+  image: taskflow:local
+  build: .
+  environment:
+    ENVIRONMENT: production
+    API_SECRET_KEY: ${API_SECRET_KEY:?Set a random API_SECRET_KEY in .env or your environment}
+    DATABASE_URL: sqlite:////var/lib/taskflow/taskflow_v2.db
+    CORS_ORIGINS: ${CORS_ORIGINS:-[]}
+    RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-120}
+    RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+    RATE_LIMIT_MAX_CLIENTS: ${RATE_LIMIT_MAX_CLIENTS:-4096}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  volumes:
+    - taskflow-data:/var/lib/taskflow
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: true
+
+services:
+  migrate:
+    <<: *taskflow
+    command: ["python", "-m", "taskflow.migrate"]
+    healthcheck:
+      disable: true
+  api:
+    <<: *taskflow
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8000:8000"
+
+volumes:
+  taskflow-data:
