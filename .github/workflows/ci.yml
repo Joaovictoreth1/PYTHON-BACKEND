@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: "requirements*.txt"
+      - run: python -m pip install -r requirements-dev.txt
+      - run: make check audit PYTHON=python
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: docker build --tag taskflow:ci .
+      - name: Smoke-test migration, readiness, and authentication
+        env:
+          IMAGE: taskflow:ci
+        run: |
+          export API_SECRET_KEY="$(openssl rand -hex 32)"
+          docker volume create taskflow-ci-data
+          docker run --rm --env API_SECRET_KEY -v taskflow-ci-data:/var/lib/taskflow \
+            "$IMAGE" python -m taskflow.migrate
+          docker run -d --name taskflow-ci --env API_SECRET_KEY \
+            -v taskflow-ci-data:/var/lib/taskflow -p 127.0.0.1:8000:8000 "$IMAGE"
+          curl --retry 15 --retry-delay 1 --retry-all-errors -fsS http://127.0.0.1:8000/health
+          curl -fsS -H "X-API-Key: $API_SECRET_KEY" http://127.0.0.1:8000/api/v1/stats
